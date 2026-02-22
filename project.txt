@@ -1,0 +1,2340 @@
+// OpenFolderTest.cpp
+// Win32 GUI - borderless compact toolbar with fancy icons, auto-width,
+// themed Settings window (including buttons) and themed popup menus.
+//
+// Current features included:
+// - Main bar: Project input supports 4 digits or full B00#### (enter opens folder)
+// - Folder dropdown: lists subfolders in resolved project folder
+// - Recent dropdown: last 10 opened folders/subfolders
+// - Search rule: project folder match uses ONLY first 7 chars (B00####) within range folder
+// - DOC tab: Project List window with editable cells, folder-open icon, delete icon
+// - DOC: TAB on Job No normalizes to 7 chars and auto-fills Description from real folder name (excluding job id)
+// - Edits (main + DOC filters + DOC overlay edit) have WHITE background (not black)
+//
+// Updates in this version:
+// - DOC icon is visible by default (confirmed): showDoc = true
+// - Progress column disabled for now (hidden + not editable + skipped in TAB order)
+// - Default Status for new rows = 1
+// - Due date format: dd.MM.yyyy
+// - Due input: allow typing as 8 digits "ddmmyyyy" OR "dd.mm.yyyy" (also accepts / or -)
+
+#include <windows.h>
+#include <windowsx.h>
+#include <commctrl.h>
+#include <shellapi.h>
+#include <uxtheme.h>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <cstdio>
+
+#pragma comment(lib, "Comctl32.lib")
+#pragma comment(lib, "UxTheme.lib")
+
+#ifndef EM_SETCUEBANNER
+#define EM_SETCUEBANNER (ECM_FIRST + 1)
+#endif
+
+#ifndef GET_X_LPARAM
+#define GET_X_LPARAM(lp) ((int)(short)LOWORD(lp))
+#endif
+#ifndef GET_Y_LPARAM
+#define GET_Y_LPARAM(lp) ((int)(short)HIWORD(lp))
+#endif
+
+// -------------------- Defaults --------------------
+
+static const wchar_t* kDefaultBasePath = LR"(\\NGS_BNE_NAS\Project folders\WFM Brisbane)";
+static const wchar_t* kMainClassName = L"ProjectToolbarOpenerWnd";
+static const wchar_t* kSettingsClass = L"ProjectToolbarSettingsWnd";
+static const wchar_t* kDocListClass = L"ProjectToolbarDocListWnd";
+static const wchar_t* kTitle = L"Project Opener";
+
+// -------------------- IDs --------------------
+
+static const int ID_EDIT = 101;
+
+// Main toolbar buttons
+static const int ID_BTN_FLAG = 200;   // Recent
+static const int ID_BTN_FOLDER = 202;   // Folder dropdown
+static const int ID_BTN_DOC = 203;   // DOC (Project List)
+static const int ID_BTN_MAIL = 204;   // (unconfirmed)
+static const int ID_BTN_CAL = 205;   // Calendar
+static const int ID_BTN_PHONE = 206;   // (unconfirmed)
+static const int ID_BTN_GEAR = 207;   // Settings
+
+// Settings controls
+static const int ID_SET_EDIT_BASE = 301;
+static const int ID_SET_OK = 302;
+static const int ID_SET_CANCEL = 303;
+static const int ID_SET_DEFAULTPATH = 304;
+
+static const int ID_SET_BG_BTN = 320;
+static const int ID_SET_FG_BTN = 321;
+static const int ID_SET_BG_SAMPLE = 322;
+static const int ID_SET_FG_SAMPLE = 323;
+
+// Settings icon checkbox IDs
+static const int ID_CHK_FLAG = 401;
+static const int ID_CHK_FOLDER = 402;
+static const int ID_CHK_DOC = 403;
+static const int ID_CHK_MAIL = 404;
+static const int ID_CHK_CAL = 405;
+static const int ID_CHK_PHONE = 406;
+static const int ID_CHK_GEAR = 407;
+
+// Calendar context menu commands
+static const int ID_CAL_OPEN = 501;
+static const int ID_CAL_NEWAPPT = 502;
+
+// Dynamic menu command bases
+static const int ID_SUBFOLDER_BASE = 6000;
+static const int ID_RECENT_BASE = 7000;
+
+// DOC list controls
+static const int ID_DOC_LISTVIEW = 8001;
+static const int ID_DOC_ADDLINE = 8002;
+static const int ID_DOC_SAVE = 8003;
+static const int ID_DOC_FILTER_STATUS = 8004;
+static const int ID_DOC_FILTER_DESC = 8005;
+static const int ID_DOC_OVERLAY_EDIT = 8100;
+static const int ID_DOC_OVERLAY_SLIDER = 8101; // progress (disabled/hidden)
+
+// -------------------- State --------------------
+
+struct UiSettings
+{
+    std::wstring baseOverride; // empty => use default
+
+    bool showFlag = true;
+    bool showFolder = true;
+    bool showCal = true;
+    bool showGear = true;
+
+    // Confirmed: DOC visible by default
+    bool showDoc = true;
+
+    // unconfirmed => default OFF
+    bool showMail = false;
+    bool showPhone = false;
+
+    COLORREF bg = RGB(0, 0, 0);
+    COLORREF fg = RGB(255, 255, 255);
+};
+
+static UiSettings gSettings;
+
+static HWND  gMainHwnd = nullptr;
+static HWND  gEdit = nullptr;
+
+static HWND  gBtnFlag = nullptr;
+static HWND  gBtnFolder = nullptr;
+static HWND  gBtnDoc = nullptr;
+static HWND  gBtnMail = nullptr;
+static HWND  gBtnCal = nullptr;
+static HWND  gBtnPhone = nullptr;
+static HWND  gBtnGear = nullptr;
+
+static HFONT gUIFont = nullptr;
+static HFONT gIconFont = nullptr;
+static HFONT gMenuFont = nullptr;
+
+static HBRUSH gBgBrush = nullptr;
+static HBRUSH gMenuBgBrush = nullptr;
+static HBRUSH gSelBrush = nullptr;
+
+// White edit brush (remove black edit background)
+static HBRUSH gEditWhiteBrush = nullptr;
+
+static std::vector<std::wstring> gRecentFolders;
+static std::vector<std::wstring> gLastMenuPaths;
+
+// hover state
+static HWND gHoverBtn = nullptr;
+static bool gTrackingMouseLeave = false;
+
+// owner-drawn menu label storage
+static std::vector<std::wstring> gMenuText;
+static int gMenuTextBase = 0;
+
+static WNDPROC gOldEditProc = nullptr;
+
+// -------------------- Helpers --------------------
+
+static std::wstring GetActiveBasePath()
+{
+    return gSettings.baseOverride.empty() ? std::wstring(kDefaultBasePath) : gSettings.baseOverride;
+}
+
+static COLORREF Blend(COLORREF a, COLORREF b, int t /*0..255*/)
+{
+    int ar = GetRValue(a), ag = GetGValue(a), ab = GetBValue(a);
+    int br = GetRValue(b), bg = GetGValue(b), bb = GetBValue(b);
+    int rr = (ar * (255 - t) + br * t) / 255;
+    int rg = (ag * (255 - t) + bg * t) / 255;
+    int rb = (ab * (255 - t) + bb * t) / 255;
+    return RGB(rr, rg, rb);
+}
+
+static void RebuildBrush()
+{
+    if (gBgBrush) DeleteObject(gBgBrush);
+    gBgBrush = CreateSolidBrush(gSettings.bg);
+
+    if (gMenuBgBrush) DeleteObject(gMenuBgBrush);
+    gMenuBgBrush = CreateSolidBrush(gSettings.bg);
+
+    if (gSelBrush) DeleteObject(gSelBrush);
+    gSelBrush = CreateSolidBrush(Blend(gSettings.bg, gSettings.fg, 30));
+
+    if (!gEditWhiteBrush) gEditWhiteBrush = CreateSolidBrush(RGB(255, 255, 255));
+}
+
+static void ApplyFont(HWND h, HFONT f)
+{
+    SendMessageW(h, WM_SETFONT, (WPARAM)f, TRUE);
+}
+
+static bool DirectoryExists(const std::wstring& path)
+{
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return false;
+    return (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+static void OpenFolderInExplorer(const std::wstring& folderPath)
+{
+    std::wstring args = L"\"" + folderPath + L"\"";
+    ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+}
+
+static void AddRecentFolder(const std::wstring& path)
+{
+    auto it = std::find(gRecentFolders.begin(), gRecentFolders.end(), path);
+    if (it != gRecentFolders.end()) gRecentFolders.erase(it);
+    gRecentFolders.insert(gRecentFolders.begin(), path);
+    if (gRecentFolders.size() > 10) gRecentFolders.resize(10);
+}
+
+static std::wstring Pad6(int n)
+{
+    wchar_t buf[16]{};
+    swprintf_s(buf, L"%06d", n);
+    return buf;
+}
+
+static std::wstring RemoveInnerSpaces(std::wstring s)
+{
+    s.erase(std::remove_if(s.begin(), s.end(), [](wchar_t c) {
+        return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n';
+        }), s.end());
+    return s;
+}
+
+static std::wstring TrimSpaces(std::wstring s)
+{
+    auto is_space = [](wchar_t c) { return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n'; };
+    while (!s.empty() && is_space(s.front())) s.erase(s.begin());
+    while (!s.empty() && is_space(s.back()))  s.pop_back();
+    return s;
+}
+
+static std::wstring TrimLeadingSeparators(std::wstring s)
+{
+    while (!s.empty()) {
+        wchar_t c = s.front();
+        if (c == L' ' || c == L'-' || c == L'_' || c == L'.') s.erase(s.begin());
+        else break;
+    }
+    return TrimSpaces(s);
+}
+
+static bool ParseProjectInput(const std::wstring& raw, std::wstring& outDigits4)
+{
+    std::wstring s = RemoveInnerSpaces(raw);
+    for (auto& ch : s) ch = (wchar_t)towupper(ch);
+
+    if (s.size() == 7 && s[0] == L'B' && s[1] == L'0' && s[2] == L'0') {
+        std::wstring d4 = s.substr(3, 4);
+        if (std::all_of(d4.begin(), d4.end(), iswdigit)) { outDigits4 = d4; return true; }
+        return false;
+    }
+
+    if (s.size() == 4 && std::all_of(s.begin(), s.end(), iswdigit)) { outDigits4 = s; return true; }
+    return false;
+}
+
+// DOC parsing:
+// - Accept "B00dddd ..." or "dddd ..." (like main screen)
+// - Job = 7 chars (B00 + 4 digits), ignore anything after those 7
+static bool ParseJob7FromInput(const std::wstring& raw, std::wstring& outJob7)
+{
+    std::wstring s = TrimSpaces(raw);
+    if (s.empty()) return false;
+
+    std::wstring up = s;
+    for (auto& ch : up) ch = (wchar_t)towupper(ch);
+
+    if (up.size() >= 7 && up[0] == L'B' && up[1] == L'0' && up[2] == L'0' &&
+        iswdigit(up[3]) && iswdigit(up[4]) && iswdigit(up[5]) && iswdigit(up[6]))
+    {
+        outJob7 = up.substr(0, 7);
+        return true;
+    }
+
+    if (up.size() >= 4 && iswdigit(up[0]) && iswdigit(up[1]) && iswdigit(up[2]) && iswdigit(up[3])) {
+        std::wstring d4 = up.substr(0, 4);
+        outJob7 = L"B00" + d4;
+        return true;
+    }
+
+    return false;
+}
+
+static bool PickColor(HWND owner, COLORREF& ioColor)
+{
+    static COLORREF custom[16]{};
+    CHOOSECOLORW cc{};
+    cc.lStructSize = sizeof(cc);
+    cc.hwndOwner = owner;
+    cc.rgbResult = ioColor;
+    cc.lpCustColors = custom;
+    cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+    if (ChooseColorW(&cc)) {
+        ioColor = cc.rgbResult;
+        return true;
+    }
+    return false;
+}
+
+// -------------------- Search by first 7 chars --------------------
+
+static bool FindProjectFolderByPrefix(
+    const std::wstring& rangeFolderPath,
+    const std::wstring& projectId7,
+    std::wstring& outFullProjectPath)
+{
+    std::wstring pattern = rangeFolderPath + L"\\*";
+    WIN32_FIND_DATAW ffd{};
+    HANDLE h = FindFirstFileW(pattern.c_str(), &ffd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    bool found = false;
+
+    do {
+        if (!(ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+
+        const wchar_t* name = ffd.cFileName;
+        if (wcscmp(name, L".") == 0 || wcscmp(name, L"..") == 0) continue;
+
+        if (_wcsnicmp(name, projectId7.c_str(), 7) == 0) {
+            outFullProjectPath = rangeFolderPath + L"\\" + name;
+            found = true;
+            break;
+        }
+    } while (FindNextFileW(h, &ffd));
+
+    FindClose(h);
+    return found;
+}
+
+// Resolve a project folder path from a 7-char job id like "B001234"
+static bool ResolveProjectFolderFromJob7(const std::wstring& job7, std::wstring& outProjectFolderFullPath)
+{
+    if (job7.size() < 7) return false;
+    if (!(job7[0] == L'B' && job7[1] == L'0' && job7[2] == L'0')) return false;
+    if (!iswdigit(job7[3]) || !iswdigit(job7[4]) || !iswdigit(job7[5]) || !iswdigit(job7[6])) return false;
+
+    std::wstring digits4 = job7.substr(3, 4);
+    int num = _wtoi(digits4.c_str());
+    if (num < 0 || num > 9999) return false;
+    if (num == 0) num = 1;
+
+    const int blockSize = 500;
+    const int start = ((num - 1) / blockSize) * blockSize + 1;
+    const int end = start + (blockSize - 1);
+
+    const std::wstring rangeFolder = L"B" + Pad6(start) + L" - " + L"B" + Pad6(end);
+    std::wstring rangePath = GetActiveBasePath() + L"\\" + rangeFolder;
+
+    std::wstring foundProjectPath;
+    if (FindProjectFolderByPrefix(rangePath, job7, foundProjectPath)) {
+        outProjectFolderFullPath = foundProjectPath;
+    }
+    else {
+        outProjectFolderFullPath = rangePath + L"\\" + job7;
+    }
+    return true;
+}
+
+static std::wstring LeafNameFromPath(const std::wstring& path)
+{
+    size_t last = path.find_last_of(L"\\/");
+    if (last == std::wstring::npos) return path;
+    return path.substr(last + 1);
+}
+
+// -------------------- Outlook actions --------------------
+
+static void OutlookOpenCalendar()
+{
+    HINSTANCE r = ShellExecuteW(nullptr, L"open", L"outlookcal:", nullptr, nullptr, SW_SHOWNORMAL);
+    if ((INT_PTR)r <= 32) {
+        ShellExecuteW(nullptr, L"open", L"outlook.exe", L"/select outlook:calendar", nullptr, SW_SHOWNORMAL);
+    }
+}
+
+static void OutlookNewAppointment()
+{
+    ShellExecuteW(nullptr, L"open", L"outlook.exe", L"/c ipm.appointment", nullptr, SW_SHOWNORMAL);
+}
+
+// -------------------- Auto-size bar --------------------
+
+static int CountVisibleButtons()
+{
+    int n = 0;
+    if (gSettings.showFlag)   n++;
+    if (gSettings.showFolder) n++;
+    if (gSettings.showDoc)    n++;
+    if (gSettings.showMail)   n++;
+    if (gSettings.showCal)    n++;
+    if (gSettings.showPhone)  n++;
+    if (gSettings.showGear)   n++;
+    return n;
+}
+
+static void ResizeWindowToFit()
+{
+    const int padL = 6;
+    const int padR = 6;
+    const int btnW = 30;
+    const int gapBtn = 5;
+    const int editW = 165;
+    const int gapAfterEdit = 8;
+
+    int width = padL;
+
+    if (gSettings.showFlag)   width += btnW + gapBtn;
+    if (gSettings.showFolder) width += btnW + gapBtn;
+
+    width += editW + gapAfterEdit;
+
+    if (gSettings.showDoc)   width += btnW + gapBtn;
+    if (gSettings.showMail)  width += btnW + gapBtn;
+    if (gSettings.showCal)   width += btnW + gapBtn;
+    if (gSettings.showPhone) width += btnW + gapBtn;
+    if (gSettings.showGear)  width += btnW + gapBtn;
+
+    if (CountVisibleButtons() > 0) width -= gapBtn;
+    width += padR;
+
+    const int height = 40;
+    SetWindowPos(gMainHwnd, nullptr, 0, 0, width, height,
+        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void LayoutMainBar()
+{
+    if (!gMainHwnd) return;
+
+    const int pad = 6;
+    const int btnW = 30;
+    const int btnH = 24;
+    const int yBtn = 8;
+
+    int x = pad;
+
+    auto placeBtn = [&](HWND hBtn, bool visible)
+        {
+            if (!hBtn) return;
+            ShowWindow(hBtn, visible ? SW_SHOW : SW_HIDE);
+            if (visible) {
+                SetWindowPos(hBtn, nullptr, x, yBtn, btnW, btnH, SWP_NOZORDER);
+                x += btnW + 5;
+            }
+        };
+
+    placeBtn(gBtnFlag, gSettings.showFlag);
+    placeBtn(gBtnFolder, gSettings.showFolder);
+
+    if (gEdit) {
+        const int editW = 165;
+        SetWindowPos(gEdit, nullptr, x, yBtn, editW, btnH, SWP_NOZORDER);
+        x += editW + 8;
+    }
+
+    placeBtn(gBtnDoc, gSettings.showDoc);
+    placeBtn(gBtnMail, gSettings.showMail);
+    placeBtn(gBtnCal, gSettings.showCal);
+    placeBtn(gBtnPhone, gSettings.showPhone);
+    placeBtn(gBtnGear, gSettings.showGear);
+
+    ResizeWindowToFit();
+    InvalidateRect(gMainHwnd, nullptr, TRUE);
+}
+
+// -------------------- Project open logic --------------------
+
+static bool ResolveProjectFolderFromEdit(std::wstring& outProjectFolderFullPath)
+{
+    wchar_t buf[128]{};
+    GetWindowTextW(gEdit, buf, (int)_countof(buf));
+    std::wstring raw = buf;
+
+    std::wstring digits4;
+    if (!ParseProjectInput(raw, digits4)) {
+        MessageBoxW(gMainHwnd,
+            L"Type the project as 4 digits (e.g., 1234) or full ID (e.g., B001234).",
+            L"Invalid project number", MB_ICONERROR);
+        return false;
+    }
+
+    std::wstring projectId7 = (digits4 == L"0000") ? (L"B" + Pad6(1)) : (L"B00" + digits4);
+
+    std::wstring path;
+    if (!ResolveProjectFolderFromJob7(projectId7, path)) {
+        MessageBoxW(gMainHwnd, L"Failed to resolve project folder.", L"Error", MB_ICONERROR);
+        return false;
+    }
+
+    outProjectFolderFullPath = path;
+    return true;
+}
+
+static void OpenProjectFromEnter()
+{
+    std::wstring projectPath;
+    if (!ResolveProjectFolderFromEdit(projectPath)) { SetFocus(gEdit); return; }
+
+    if (!DirectoryExists(projectPath)) {
+        std::wstring msg = L"Project folder not found:\n\n" + projectPath;
+        MessageBoxW(gMainHwnd, msg.c_str(), L"Not found", MB_ICONERROR);
+        SetFocus(gEdit);
+        return;
+    }
+
+    OpenFolderInExplorer(projectPath);
+    AddRecentFolder(projectPath);
+
+    SetWindowTextW(gEdit, L"");
+    SetFocus(gEdit);
+}
+
+static void ShowFolderDropdown();
+static void ShowRecentDropdown();
+
+static LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (msg == WM_KEYDOWN)
+    {
+        if (wParam == VK_RETURN) { OpenProjectFromEnter(); return 0; }
+
+        if (wParam == VK_F4 || (wParam == VK_DOWN && (GetKeyState(VK_MENU) & 0x8000))) {
+            ShowFolderDropdown();
+            return 0;
+        }
+
+        if (wParam == VK_F3 || (wParam == VK_UP && (GetKeyState(VK_MENU) & 0x8000))) {
+            ShowRecentDropdown();
+            return 0;
+        }
+
+        if (wParam == VK_ESCAPE) {
+            SetWindowTextW(gEdit, L"");
+            return 0;
+        }
+    }
+
+    return CallWindowProcW(gOldEditProc, hwnd, msg, wParam, lParam);
+}
+
+// -------------------- Folder listing --------------------
+
+static std::vector<std::wstring> ListSubfolders(const std::wstring& parent)
+{
+    std::vector<std::wstring> out;
+
+    std::wstring pattern = parent + L"\\*";
+    WIN32_FIND_DATAW ffd{};
+    HANDLE h = FindFirstFileW(pattern.c_str(), &ffd);
+    if (h == INVALID_HANDLE_VALUE) return out;
+
+    do {
+        if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            const wchar_t* name = ffd.cFileName;
+            if (wcscmp(name, L".") == 0 || wcscmp(name, L"..") == 0) continue;
+            out.emplace_back(name);
+        }
+    } while (FindNextFileW(h, &ffd));
+
+    FindClose(h);
+
+    std::sort(out.begin(), out.end(), [](const std::wstring& a, const std::wstring& b) {
+        return _wcsicmp(a.c_str(), b.c_str()) < 0;
+        });
+
+    return out;
+}
+
+static std::wstring ShortLabelFromPath(const std::wstring& path)
+{
+    size_t last = path.find_last_of(L"\\/");
+    if (last == std::wstring::npos) return path;
+    size_t prev = path.find_last_of(L"\\/", (last > 0) ? last - 1 : 0);
+    if (prev == std::wstring::npos) return path.substr(last + 1);
+    return path.substr(prev + 1);
+}
+
+// -------------------- Owner-draw menu helpers --------------------
+
+static void MenuTheme_Begin(int baseId, int count)
+{
+    gMenuTextBase = baseId;
+    gMenuText.assign(count, L"");
+}
+
+static void MenuTheme_SetText(int cmdId, const std::wstring& s)
+{
+    int idx = cmdId - gMenuTextBase;
+    if (idx >= 0 && idx < (int)gMenuText.size()) gMenuText[idx] = s;
+}
+
+static const std::wstring* MenuTheme_GetText(int cmdId)
+{
+    int idx = cmdId - gMenuTextBase;
+    if (idx >= 0 && idx < (int)gMenuText.size()) return &gMenuText[idx];
+    return nullptr;
+}
+
+static void MenuTheme_AppendOwnerDrawItem(HMENU menu, int cmdId, const std::wstring& label)
+{
+    MENUITEMINFOW mi{};
+    mi.cbSize = sizeof(mi);
+    mi.fMask = MIIM_ID | MIIM_FTYPE;
+    mi.wID = cmdId;
+    mi.fType = MFT_OWNERDRAW;
+    InsertMenuItemW(menu, (UINT)-1, TRUE, &mi);
+    MenuTheme_SetText(cmdId, label);
+}
+
+static int ShowThemedPopupMenu(HMENU menu, HWND anchorBtn)
+{
+    RECT r{};
+    GetWindowRect(anchorBtn, &r);
+    POINT pt{ r.left, r.bottom };
+    SetForegroundWindow(gMainHwnd);
+
+    int cmd = TrackPopupMenu(menu,
+        TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+        pt.x, pt.y, 0, gMainHwnd, nullptr);
+
+    DestroyMenu(menu);
+    return cmd;
+}
+
+// -------------------- Dropdowns --------------------
+
+static void ShowFolderDropdown()
+{
+    std::wstring projectPath;
+    if (!ResolveProjectFolderFromEdit(projectPath)) { SetFocus(gEdit); return; }
+
+    if (!DirectoryExists(projectPath)) {
+        std::wstring msg = L"Project folder not found:\n\n" + projectPath;
+        MessageBoxW(gMainHwnd, msg.c_str(), L"Folder", MB_ICONERROR);
+        SetFocus(gEdit);
+        return;
+    }
+
+    auto subfolders = ListSubfolders(projectPath);
+    if (subfolders.empty()) {
+        MessageBoxW(gMainHwnd, L"No subfolders found in the project folder.", L"Folder", MB_ICONINFORMATION);
+        return;
+    }
+
+    HMENU menu = CreatePopupMenu();
+    gLastMenuPaths.clear();
+    gLastMenuPaths.reserve(subfolders.size());
+
+    const int maxItems = min(300, (int)subfolders.size());
+    MenuTheme_Begin(ID_SUBFOLDER_BASE, maxItems);
+
+    for (int i = 0; i < maxItems; ++i) {
+        std::wstring full = projectPath + L"\\" + subfolders[i];
+        gLastMenuPaths.push_back(full);
+        MenuTheme_AppendOwnerDrawItem(menu, ID_SUBFOLDER_BASE + i, subfolders[i]);
+    }
+
+    int cmd = ShowThemedPopupMenu(menu, gBtnFolder);
+
+    if (cmd >= ID_SUBFOLDER_BASE && cmd < ID_SUBFOLDER_BASE + (int)gLastMenuPaths.size()) {
+        const std::wstring& chosen = gLastMenuPaths[cmd - ID_SUBFOLDER_BASE];
+        if (DirectoryExists(chosen)) {
+            OpenFolderInExplorer(chosen);
+            AddRecentFolder(chosen);
+        }
+        else {
+            MessageBoxW(gMainHwnd, L"Selected folder no longer exists.", L"Folder", MB_ICONERROR);
+        }
+    }
+}
+
+static void ShowRecentDropdown()
+{
+    if (gRecentFolders.empty()) {
+        MessageBoxW(gMainHwnd, L"No recent folders yet.\n\nOpen a project or subfolder first.",
+            L"Recent", MB_ICONINFORMATION);
+        return;
+    }
+
+    HMENU menu = CreatePopupMenu();
+    gLastMenuPaths.clear();
+    gLastMenuPaths.reserve(gRecentFolders.size());
+
+    const int count = (int)gRecentFolders.size();
+    MenuTheme_Begin(ID_RECENT_BASE, count);
+
+    for (int i = 0; i < count; ++i) {
+        gLastMenuPaths.push_back(gRecentFolders[i]);
+        MenuTheme_AppendOwnerDrawItem(menu, ID_RECENT_BASE + i, ShortLabelFromPath(gRecentFolders[i]));
+    }
+
+    int cmd = ShowThemedPopupMenu(menu, gBtnFlag);
+
+    if (cmd >= ID_RECENT_BASE && cmd < ID_RECENT_BASE + (int)gLastMenuPaths.size()) {
+        const std::wstring& chosen = gLastMenuPaths[cmd - ID_RECENT_BASE];
+        if (DirectoryExists(chosen)) {
+            OpenFolderInExplorer(chosen);
+            AddRecentFolder(chosen);
+        }
+        else {
+            MessageBoxW(gMainHwnd, L"That folder no longer exists.", L"Recent", MB_ICONERROR);
+        }
+    }
+}
+
+// -------------------- Calendar menu --------------------
+
+static void ShowCalendarContextMenu(HWND hwnd, POINT ptScreen)
+{
+    HMENU menu = CreatePopupMenu();
+
+    MenuTheme_Begin(ID_CAL_OPEN, 2);
+    MenuTheme_AppendOwnerDrawItem(menu, ID_CAL_OPEN, L"Open Calendar");
+    MenuTheme_AppendOwnerDrawItem(menu, ID_CAL_NEWAPPT, L"New Appointment");
+
+    SetForegroundWindow(gMainHwnd);
+    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+        ptScreen.x, ptScreen.y, 0, hwnd, nullptr);
+
+    DestroyMenu(menu);
+
+    if (cmd == ID_CAL_OPEN) OutlookOpenCalendar();
+    if (cmd == ID_CAL_NEWAPPT) OutlookNewAppointment();
+}
+
+// -------------------- Owner-draw renderers --------------------
+
+static void DrawFancyIconTile(HDC hdc, const RECT& rc, const wchar_t* text,
+    HFONT font, bool hot, bool pressed, bool disabled, bool focused)
+{
+    FillRect(hdc, &rc, gBgBrush);
+
+    RECT tile = rc;
+    InflateRect(&tile, -2, -2);
+
+    COLORREF border = Blend(gSettings.fg, gSettings.bg, 120);
+    COLORREF fillNormal = gSettings.bg;
+    COLORREF fillHot = Blend(gSettings.bg, gSettings.fg, 28);
+    COLORREF fillPressed = Blend(gSettings.bg, gSettings.fg, 45);
+
+    COLORREF fill = fillNormal;
+    if (pressed) fill = fillPressed;
+    else if (hot) fill = fillHot;
+
+    HBRUSH hFill = CreateSolidBrush(fill);
+    FillRect(hdc, &tile, hFill);
+    DeleteObject(hFill);
+
+    HPEN pen = CreatePen(PS_SOLID, 1, border);
+    HGDIOBJ oldPen = SelectObject(hdc, pen);
+    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Rectangle(hdc, tile.left, tile.top, tile.right, tile.bottom);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(pen);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, disabled ? Blend(gSettings.fg, gSettings.bg, 160) : gSettings.fg);
+    HFONT oldF = (HFONT)SelectObject(hdc, font);
+
+    RECT tr = tile;
+    if (pressed) OffsetRect(&tr, 1, 1);
+    DrawTextW(hdc, text, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    SelectObject(hdc, oldF);
+
+    if (focused) {
+        RECT fr = tile;
+        InflateRect(&fr, -3, -3);
+        DrawFocusRect(hdc, &fr);
+    }
+}
+
+static void DrawFancyIconButton(const DRAWITEMSTRUCT* dis)
+{
+    wchar_t text[64]{};
+    GetWindowTextW(dis->hwndItem, text, _countof(text));
+
+    const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+    const bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+    const bool focused = (dis->itemState & ODS_FOCUS) != 0;
+    const bool hot = (gHoverBtn == dis->hwndItem);
+
+    DrawFancyIconTile(dis->hDC, dis->rcItem, text, gIconFont, hot, pressed, disabled, focused);
+}
+
+static void MeasureThemedMenuItem(MEASUREITEMSTRUCT* mi)
+{
+    const std::wstring* label = MenuTheme_GetText((int)mi->itemID);
+    std::wstring text = label ? *label : L"";
+
+    HDC hdc = GetDC(gMainHwnd);
+    HFONT oldF = (HFONT)SelectObject(hdc, gMenuFont ? gMenuFont : gUIFont);
+
+    SIZE sz{};
+    GetTextExtentPoint32W(hdc, text.c_str(), (int)text.size(), &sz);
+
+    SelectObject(hdc, oldF);
+    ReleaseDC(gMainHwnd, hdc);
+
+    mi->itemHeight = max(24u, (UINT)sz.cy + 10);
+    mi->itemWidth = (UINT)sz.cx + 30;
+}
+
+static void DrawThemedMenuItem(const DRAWITEMSTRUCT* dis)
+{
+    RECT rc = dis->rcItem;
+    HDC hdc = dis->hDC;
+
+    const bool selected = (dis->itemState & ODS_SELECTED) != 0;
+    const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+
+    FillRect(hdc, &rc, selected ? gSelBrush : gMenuBgBrush);
+
+    const std::wstring* label = MenuTheme_GetText((int)dis->itemID);
+    std::wstring text = label ? *label : L"";
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, disabled ? Blend(gSettings.fg, gSettings.bg, 160) : gSettings.fg);
+
+    HFONT oldF = (HFONT)SelectObject(hdc, gMenuFont ? gMenuFont : gUIFont);
+
+    RECT tr = rc;
+    tr.left += 10;
+    tr.right -= 10;
+    DrawTextW(hdc, text.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    SelectObject(hdc, oldF);
+}
+
+static void BeginTrackMouseLeave()
+{
+    if (gTrackingMouseLeave) return;
+    TRACKMOUSEEVENT tme{};
+    tme.cbSize = sizeof(tme);
+    tme.dwFlags = TME_LEAVE;
+    tme.hwndTrack = gMainHwnd;
+    TrackMouseEvent(&tme);
+    gTrackingMouseLeave = true;
+}
+
+// -------------------- Settings window --------------------
+// (unchanged from prior version)
+
+struct SettingsState {
+    HWND parent = nullptr;
+    HWND editBase = nullptr;
+    HWND bgSample = nullptr;
+    HWND fgSample = nullptr;
+    bool done = false;
+    UiSettings working;
+};
+
+static void SetSampleText(HWND h, const wchar_t* label, COLORREF c)
+{
+    wchar_t buf[128]{};
+    swprintf_s(buf, L"%s  (R:%d G:%d B:%d)", label, GetRValue(c), GetGValue(c), GetBValue(c));
+    SetWindowTextW(h, buf);
+}
+
+static bool IsChecked(HWND hDlg, int id)
+{
+    HWND h = GetDlgItem(hDlg, id);
+    return (SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED);
+}
+
+static void SetChecked(HWND hDlg, int id, bool v)
+{
+    HWND h = GetDlgItem(hDlg, id);
+    SendMessageW(h, BM_SETCHECK, v ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
+static HWND CreateIconCheckbox(HWND parent, int id, const wchar_t* glyph, int x, int y)
+{
+    HWND hCtl = CreateWindowW(L"BUTTON", glyph,
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        x, y, 48, 28,
+        parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    ApplyFont(hCtl, gIconFont);
+    return hCtl;
+}
+
+static HWND CreateSettingsTileButton(HWND parent, int id, const wchar_t* label, int x, int y, int w, int h)
+{
+    HWND b = CreateWindowW(L"BUTTON", label,
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        x, y, w, h,
+        parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    ApplyFont(b, gUIFont);
+    return b;
+}
+
+static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    auto* st = reinterpret_cast<SettingsState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+    switch (msg)
+    {
+    case WM_CREATE:
+    {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        st = reinterpret_cast<SettingsState*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)st);
+
+        const int pad = 12;
+
+        CreateWindowW(L"STATIC",
+            L"Temporary Base Path Override (blank = default):",
+            WS_CHILD | WS_VISIBLE,
+            pad, 12, 520, 18, hwnd, nullptr, nullptr, nullptr);
+
+        st->editBase = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT",
+            st->working.baseOverride.empty() ? kDefaultBasePath : st->working.baseOverride.c_str(),
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            pad, 34, 540, 26, hwnd, (HMENU)(INT_PTR)ID_SET_EDIT_BASE, nullptr, nullptr);
+        ApplyFont(st->editBase, gUIFont);
+
+        CreateSettingsTileButton(hwnd, ID_SET_DEFAULTPATH, L"Default", pad + 550, 34, 80, 26);
+
+        CreateWindowW(L"STATIC", L"Show icons (tick = visible):",
+            WS_CHILD | WS_VISIBLE,
+            pad, 70, 260, 18, hwnd, nullptr, nullptr, nullptr);
+
+        int x = pad;
+        int y = 92;
+        CreateIconCheckbox(hwnd, ID_CHK_FLAG, L"\uE7C1", x, y); x += 58;
+        CreateIconCheckbox(hwnd, ID_CHK_FOLDER, L"\uE8B7", x, y); x += 58;
+        CreateIconCheckbox(hwnd, ID_CHK_DOC, L"\uE8A5", x, y); x += 58;
+        CreateIconCheckbox(hwnd, ID_CHK_MAIL, L"\uE715", x, y); x += 58;
+        CreateIconCheckbox(hwnd, ID_CHK_CAL, L"\uE787", x, y); x += 58;
+        CreateIconCheckbox(hwnd, ID_CHK_PHONE, L"\uE717", x, y); x += 58;
+        CreateIconCheckbox(hwnd, ID_CHK_GEAR, L"\uE713", x, y); x += 58;
+
+        SetChecked(hwnd, ID_CHK_FLAG, st->working.showFlag);
+        SetChecked(hwnd, ID_CHK_FOLDER, st->working.showFolder);
+        SetChecked(hwnd, ID_CHK_DOC, st->working.showDoc);
+        SetChecked(hwnd, ID_CHK_MAIL, st->working.showMail);
+        SetChecked(hwnd, ID_CHK_CAL, st->working.showCal);
+        SetChecked(hwnd, ID_CHK_PHONE, st->working.showPhone);
+        SetChecked(hwnd, ID_CHK_GEAR, st->working.showGear);
+
+        CreateWindowW(L"STATIC", L"Colours:",
+            WS_CHILD | WS_VISIBLE,
+            pad, 130, 120, 18, hwnd, nullptr, nullptr, nullptr);
+
+        CreateSettingsTileButton(hwnd, ID_SET_BG_BTN, L"Background...", pad, 152, 120, 28);
+
+        st->bgSample = CreateWindowW(L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE,
+            pad + 130, 158, 220, 18, hwnd, (HMENU)(INT_PTR)ID_SET_BG_SAMPLE, nullptr, nullptr);
+        ApplyFont(st->bgSample, gUIFont);
+
+        CreateSettingsTileButton(hwnd, ID_SET_FG_BTN, L"Text...", pad + 360, 152, 90, 28);
+
+        st->fgSample = CreateWindowW(L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE,
+            pad + 455, 158, 220, 18, hwnd, (HMENU)(INT_PTR)ID_SET_FG_SAMPLE, nullptr, nullptr);
+        ApplyFont(st->fgSample, gUIFont);
+
+        SetSampleText(st->bgSample, L"BG", st->working.bg);
+        SetSampleText(st->fgSample, L"Text", st->working.fg);
+
+        CreateSettingsTileButton(hwnd, ID_SET_OK, L"OK", 460, 200, 80, 28);
+        CreateSettingsTileButton(hwnd, ID_SET_CANCEL, L"Cancel", 550, 200, 80, 28);
+
+        SetFocus(st->editBase);
+        return 0;
+    }
+
+    case WM_ERASEBKGND:
+    {
+        HDC hdc = (HDC)wParam;
+        RECT r; GetClientRect(hwnd, &r);
+        FillRect(hdc, &r, gBgBrush);
+        return TRUE;
+    }
+
+    case WM_CTLCOLORDLG:
+        return (INT_PTR)gBgBrush;
+
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    {
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, gSettings.fg);
+        SetBkColor(hdc, gSettings.bg);
+        SetBkMode(hdc, (msg == WM_CTLCOLORSTATIC) ? TRANSPARENT : OPAQUE);
+        return (INT_PTR)gBgBrush;
+    }
+
+    case WM_DRAWITEM:
+    {
+        const DRAWITEMSTRUCT* dis = (const DRAWITEMSTRUCT*)lParam;
+        if (!dis || dis->CtlType != ODT_BUTTON) break;
+
+        wchar_t text[128]{};
+        GetWindowTextW(dis->hwndItem, text, _countof(text));
+
+        bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+        bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+        bool focused = (dis->itemState & ODS_FOCUS) != 0;
+
+        DrawFancyIconTile(dis->hDC, dis->rcItem, text, gUIFont, false, pressed, disabled, focused);
+        return TRUE;
+    }
+
+    case WM_COMMAND:
+    {
+        const int id = LOWORD(wParam);
+
+        if (id == ID_SET_DEFAULTPATH) {
+            SetWindowTextW(st->editBase, kDefaultBasePath);
+            SetFocus(st->editBase);
+            return 0;
+        }
+
+        if (id == ID_SET_BG_BTN) {
+            if (PickColor(hwnd, st->working.bg)) SetSampleText(st->bgSample, L"BG", st->working.bg);
+            return 0;
+        }
+
+        if (id == ID_SET_FG_BTN) {
+            if (PickColor(hwnd, st->working.fg)) SetSampleText(st->fgSample, L"Text", st->working.fg);
+            return 0;
+        }
+
+        if (id == ID_SET_OK) {
+            wchar_t pathBuf[4096]{};
+            GetWindowTextW(st->editBase, pathBuf, _countof(pathBuf));
+            std::wstring p = TrimSpaces(pathBuf);
+
+            if (p.empty() || _wcsicmp(p.c_str(), kDefaultBasePath) == 0) st->working.baseOverride.clear();
+            else st->working.baseOverride = p;
+
+            st->working.showFlag = IsChecked(hwnd, ID_CHK_FLAG);
+            st->working.showFolder = IsChecked(hwnd, ID_CHK_FOLDER);
+            st->working.showDoc = IsChecked(hwnd, ID_CHK_DOC);
+            st->working.showMail = IsChecked(hwnd, ID_CHK_MAIL);
+            st->working.showCal = IsChecked(hwnd, ID_CHK_CAL);
+            st->working.showPhone = IsChecked(hwnd, ID_CHK_PHONE);
+            st->working.showGear = IsChecked(hwnd, ID_CHK_GEAR);
+
+            if (!st->working.showGear) {
+                MessageBoxW(hwnd, L"Gear icon cannot be hidden (Settings must remain accessible).", L"Notice", MB_OK);
+                st->working.showGear = true;
+                SetChecked(hwnd, ID_CHK_GEAR, true);
+                return 0;
+            }
+
+            gSettings = st->working;
+            RebuildBrush();
+            LayoutMainBar();
+
+            st->done = true;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+
+        if (id == ID_SET_CANCEL) {
+            st->done = true;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        return 0;
+    }
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+        if (st && st->parent) EnableWindow(st->parent, TRUE);
+        return 0;
+    }
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void OpenSettingsDialog(HWND parent)
+{
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = SettingsProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = kSettingsClass;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        RegisterClassW(&wc);
+        registered = true;
+    }
+
+    SettingsState st{};
+    st.parent = parent;
+    st.working = gSettings;
+
+    EnableWindow(parent, FALSE);
+
+    HWND dlg = CreateWindowExW(
+        WS_EX_DLGMODALFRAME,
+        kSettingsClass,
+        L"Settings",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        660, 280,
+        parent, nullptr, GetModuleHandleW(nullptr),
+        &st);
+
+    if (!dlg) {
+        EnableWindow(parent, TRUE);
+        MessageBoxW(parent, L"Failed to open Settings window.", L"Error", MB_ICONERROR);
+        return;
+    }
+
+    RECT pr{}, dr{};
+    GetWindowRect(parent, &pr);
+    GetWindowRect(dlg, &dr);
+    int px = pr.left + ((pr.right - pr.left) - (dr.right - dr.left)) / 2;
+    int py = pr.top + ((pr.bottom - pr.top) - (dr.bottom - dr.top)) / 2;
+    SetWindowPos(dlg, nullptr, px, py, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW);
+
+    ShowWindow(dlg, SW_SHOW);
+    UpdateWindow(dlg);
+
+    MSG m;
+    while (IsWindow(dlg) && GetMessageW(&m, nullptr, 0, 0) > 0) {
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
+    }
+}
+
+// -------------------- DOC: Project List window --------------------
+
+struct ProjectRow
+{
+    std::wstring job;   // e.g. B001234
+    std::wstring desc;
+    std::wstring scope;
+    int progress = 0;   // 0..100 (disabled/hidden)
+    bool hasDue = false;
+    SYSTEMTIME due{};
+    int status = 1;     // default to 1
+};
+
+struct DocListState
+{
+    HWND hwnd = nullptr;
+    HWND lv = nullptr;
+    HWND btnAdd = nullptr;
+    HWND btnSave = nullptr;
+    HWND editStatusFilter = nullptr;
+    HWND editDescFilter = nullptr;
+
+    // overlay editor (used for all editable fields, including Due)
+    HWND overlayEdit = nullptr;
+    HWND overlaySlider = nullptr; // progress (disabled/hidden)
+
+    int editRow = -1;
+    int editSubItem = -1;
+
+    std::vector<ProjectRow> rows;
+    std::vector<int> viewToModel;
+
+    HIMAGELIST rowHeightIL = nullptr;
+};
+
+static DocListState gDoc;
+static WNDPROC gOldOverlayEditProc = nullptr;
+
+// -------- Due format helpers (dd.MM.yyyy + flexible typing) --------
+
+static bool IsValidDateYMD(int y, int m, int d)
+{
+    if (y < 1900 || y > 3000) return false;
+    if (m < 1 || m > 12) return false;
+    if (d < 1 || d > 31) return false;
+
+    SYSTEMTIME st{};
+    st.wYear = (WORD)y;
+    st.wMonth = (WORD)m;
+    st.wDay = (WORD)d;
+
+    FILETIME ft{};
+    return SystemTimeToFileTime(&st, &ft) != 0;
+}
+
+static std::wstring FormatDue_DDMMYYYY_Dots(const SYSTEMTIME& st)
+{
+    wchar_t buf[32]{};
+    swprintf_s(buf, L"%02d.%02d.%04d", (int)st.wDay, (int)st.wMonth, (int)st.wYear);
+    return buf;
+}
+
+static std::wstring DigitsOnly(const std::wstring& s)
+{
+    std::wstring out;
+    out.reserve(s.size());
+    for (wchar_t c : s) if (c >= L'0' && c <= L'9') out.push_back(c);
+    return out;
+}
+
+// Accept:
+// - "ddmmyyyy" (8 digits)
+// - "dd.mm.yyyy" or "dd/mm/yyyy" or "dd-mm-yyyy" (any separators)
+static bool ParseDueFlexible(const std::wstring& raw, SYSTEMTIME& outSt)
+{
+    std::wstring s = TrimSpaces(raw);
+    if (s.empty()) return false;
+
+    // Fast path: extract digits
+    std::wstring dig = DigitsOnly(s);
+
+    if (dig.size() == 8) {
+        int dd = (dig[0] - L'0') * 10 + (dig[1] - L'0');
+        int mm = (dig[2] - L'0') * 10 + (dig[3] - L'0');
+        int yy = (dig[4] - L'0') * 1000 + (dig[5] - L'0') * 100 + (dig[6] - L'0') * 10 + (dig[7] - L'0');
+        if (!IsValidDateYMD(yy, mm, dd)) return false;
+
+        SYSTEMTIME st{};
+        st.wYear = (WORD)yy;
+        st.wMonth = (WORD)mm;
+        st.wDay = (WORD)dd;
+        outSt = st;
+        return true;
+    }
+
+    // If user types with separators but includes fewer digits, reject for now (keeps rule strict and predictable)
+    return false;
+}
+
+static std::wstring GetAppDataPath()
+{
+    wchar_t buf[MAX_PATH]{};
+    DWORD n = GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return L".";
+    return std::wstring(buf);
+}
+
+static std::wstring GetDocListFilePath()
+{
+    std::wstring dir = GetAppDataPath() + L"\\ProjectOpener";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir + L"\\project_list.tsv";
+}
+
+static std::wstring TsvEscape(const std::wstring& s)
+{
+    std::wstring out;
+    out.reserve(s.size());
+    for (wchar_t c : s) {
+        if (c == L'\t') out += L"    ";
+        else if (c == L'\r' || c == L'\n') out += L' ';
+        else out += c;
+    }
+    return out;
+}
+
+static void SaveDocListToDisk()
+{
+    const std::wstring path = GetDocListFilePath();
+    FILE* f = nullptr;
+    _wfopen_s(&f, path.c_str(), L"wb");
+    if (!f) return;
+
+    const wchar_t bom = 0xFEFF;
+    fwrite(&bom, sizeof(wchar_t), 1, f);
+
+    for (const auto& r : gDoc.rows) {
+        wchar_t dueBuf[32]{};
+        if (r.hasDue) {
+            swprintf_s(dueBuf, L"%04d-%02d-%02d", r.due.wYear, r.due.wMonth, r.due.wDay);
+        }
+        else {
+            wcscpy_s(dueBuf, L"");
+        }
+
+        std::wstring line =
+            TsvEscape(r.job) + L"\t" +
+            TsvEscape(r.desc) + L"\t" +
+            TsvEscape(r.scope) + L"\t" +
+            std::to_wstring(r.progress) + L"\t" +
+            dueBuf + L"\t" +
+            std::to_wstring(r.status) + L"\r\n";
+
+        fwrite(line.c_str(), sizeof(wchar_t), line.size(), f);
+    }
+
+    fclose(f);
+}
+
+static bool ParseDateYMD(const std::wstring& s, SYSTEMTIME& st)
+{
+    int y = 0, m = 0, d = 0;
+    if (swscanf_s(s.c_str(), L"%d-%d-%d", &y, &m, &d) == 3) {
+        if (IsValidDateYMD(y, m, d)) {
+            SYSTEMTIME t{};
+            t.wYear = (WORD)y;
+            t.wMonth = (WORD)m;
+            t.wDay = (WORD)d;
+            st = t;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void LoadDocListFromDisk()
+{
+    gDoc.rows.clear();
+
+    const std::wstring path = GetDocListFilePath();
+    FILE* f = nullptr;
+    _wfopen_s(&f, path.c_str(), L"rb");
+    if (!f) return;
+
+    wchar_t first{};
+    size_t r1 = fread(&first, sizeof(wchar_t), 1, f);
+    if (r1 == 1) {
+        if (first != 0xFEFF) fseek(f, 0, SEEK_SET);
+    }
+
+    wchar_t buf[8192]{};
+    std::wstring all;
+    while (true) {
+        size_t n = fread(buf, sizeof(wchar_t), _countof(buf) - 1, f);
+        if (n == 0) break;
+        buf[n] = 0;
+        all.append(buf, buf + n);
+    }
+    fclose(f);
+
+    size_t pos = 0;
+    while (pos < all.size()) {
+        size_t end = all.find(L"\n", pos);
+        if (end == std::wstring::npos) end = all.size();
+        std::wstring rowLine = all.substr(pos, end - pos);
+        if (!rowLine.empty() && rowLine.back() == L'\r') rowLine.pop_back();
+        pos = end + 1;
+
+        if (rowLine.empty()) continue;
+
+        std::vector<std::wstring> cols;
+        size_t cpos = 0;
+        while (true) {
+            size_t tab = rowLine.find(L'\t', cpos);
+            if (tab == std::wstring::npos) { cols.push_back(rowLine.substr(cpos)); break; }
+            cols.push_back(rowLine.substr(cpos, tab - cpos));
+            cpos = tab + 1;
+        }
+        while (cols.size() < 6) cols.push_back(L"");
+
+        ProjectRow r{};
+        r.job = cols[0];
+        r.desc = cols[1];
+        r.scope = cols[2];
+        r.progress = _wtoi(cols[3].c_str());
+        r.progress = max(0, min(100, r.progress));
+
+        SYSTEMTIME st{};
+        if (ParseDateYMD(cols[4], st)) { r.hasDue = true; r.due = st; }
+        r.status = _wtoi(cols[5].c_str());
+        if (r.status <= 0) r.status = 1;
+
+        gDoc.rows.push_back(r);
+    }
+}
+
+static COLORREF StatusToRowColor(int status)
+{
+    if (status == 1) return RGB(120, 220, 120);
+    if (status == 2) return RGB(160, 210, 235);
+    if (status == 3) return RGB(240, 240, 180);
+    if (status == 5) return RGB(205, 205, 205);
+    return Blend(gSettings.bg, gSettings.fg, 18);
+}
+
+static bool FilterMatch(const ProjectRow& r, const std::wstring& statusFilter, const std::wstring& descFilter)
+{
+    if (!statusFilter.empty()) {
+        int want = _wtoi(statusFilter.c_str());
+        if (want != r.status) return false;
+    }
+
+    if (!descFilter.empty()) {
+        auto hay = r.job + L" " + r.desc + L" " + r.scope;
+        auto needle = descFilter;
+        std::transform(hay.begin(), hay.end(), hay.begin(), ::towlower);
+        std::transform(needle.begin(), needle.end(), needle.begin(), ::towlower);
+        if (hay.find(needle) == std::wstring::npos) return false;
+    }
+
+    return true;
+}
+
+static bool DocList_ViewIndexToModel(int viewIndex, int& outModelIndex)
+{
+    if (viewIndex < 0 || viewIndex >= (int)gDoc.viewToModel.size()) return false;
+    outModelIndex = gDoc.viewToModel[viewIndex];
+    if (outModelIndex < 0 || outModelIndex >= (int)gDoc.rows.size()) return false;
+    return true;
+}
+
+static void DocList_RebuildView()
+{
+    if (!gDoc.lv) return;
+
+    wchar_t sbuf[128]{};
+    GetWindowTextW(gDoc.editStatusFilter, sbuf, _countof(sbuf));
+    std::wstring statusFilter = TrimSpaces(sbuf);
+
+    wchar_t dbuf[512]{};
+    GetWindowTextW(gDoc.editDescFilter, dbuf, _countof(dbuf));
+    std::wstring descFilter = TrimSpaces(dbuf);
+
+    ListView_DeleteAllItems(gDoc.lv);
+    gDoc.viewToModel.clear();
+
+    for (int i = 0; i < (int)gDoc.rows.size(); ++i) {
+        const auto& r = gDoc.rows[i];
+        if (!FilterMatch(r, statusFilter, descFilter)) continue;
+
+        int viewIndex = (int)gDoc.viewToModel.size();
+        gDoc.viewToModel.push_back(i);
+
+        // Columns:
+        // 0 Job No, 1 Open folder icon, 2 Description, 3 Scope, 4 Progress (hidden),
+        // 5 Due, 6 Status, 7 Remove
+        LVITEMW it{};
+        it.mask = LVIF_TEXT;
+        it.iItem = viewIndex;
+        it.iSubItem = 0;
+        it.pszText = (LPWSTR)(r.job.empty() ? L"" : r.job.c_str());
+        ListView_InsertItem(gDoc.lv, &it);
+
+        ListView_SetItemText(gDoc.lv, viewIndex, 1, (LPWSTR)L"\uE8B7"); // folder glyph
+        ListView_SetItemText(gDoc.lv, viewIndex, 2, (LPWSTR)(r.desc.empty() ? L"" : r.desc.c_str()));
+        ListView_SetItemText(gDoc.lv, viewIndex, 3, (LPWSTR)(r.scope.empty() ? L"" : r.scope.c_str()));
+
+        // Progress (hidden)
+        ListView_SetItemText(gDoc.lv, viewIndex, 4, (LPWSTR)L"");
+
+        // Due dd.MM.yyyy
+        std::wstring dueText;
+        if (r.hasDue) dueText = FormatDue_DDMMYYYY_Dots(r.due);
+        ListView_SetItemText(gDoc.lv, viewIndex, 5, (LPWSTR)dueText.c_str());
+
+        wchar_t stbuf2[32]{};
+        swprintf_s(stbuf2, L"%d", r.status);
+        ListView_SetItemText(gDoc.lv, viewIndex, 6, (LPWSTR)stbuf2);
+
+        ListView_SetItemText(gDoc.lv, viewIndex, 7, (LPWSTR)L"\uE74D"); // delete glyph
+    }
+}
+
+static void DocList_EnsureOverlayHidden()
+{
+    if (gDoc.overlayEdit) ShowWindow(gDoc.overlayEdit, SW_HIDE);
+    if (gDoc.overlaySlider) ShowWindow(gDoc.overlaySlider, SW_HIDE);
+    gDoc.editRow = -1;
+    gDoc.editSubItem = -1;
+}
+
+static void DocList_StartEditCell(int viewRow, int subItem);
+
+static void DocList_CommitOverlay(bool cancel)
+{
+    if (gDoc.editRow < 0 || gDoc.editSubItem < 0) { DocList_EnsureOverlayHidden(); return; }
+
+    int modelIndex = -1;
+    if (!DocList_ViewIndexToModel(gDoc.editRow, modelIndex)) { DocList_EnsureOverlayHidden(); return; }
+
+    ProjectRow& r = gDoc.rows[modelIndex];
+    const int subItem = gDoc.editSubItem;
+
+    if (!cancel) {
+        // Editable columns (progress disabled):
+        // 0 Job, 2 Desc, 3 Scope, 5 Due, 6 Status
+        wchar_t buf[2048]{};
+        GetWindowTextW(gDoc.overlayEdit, buf, _countof(buf));
+        std::wstring v = TrimSpaces(buf);
+
+        if (subItem == 0) r.job = v;
+        if (subItem == 2) r.desc = v;
+        if (subItem == 3) r.scope = v;
+
+        if (subItem == 6) {
+            int s = _wtoi(v.c_str());
+            r.status = (s <= 0) ? 1 : s;
+        }
+
+        if (subItem == 5) {
+            if (v.empty()) {
+                r.hasDue = false;
+                ZeroMemory(&r.due, sizeof(r.due));
+            }
+            else {
+                SYSTEMTIME st{};
+                if (ParseDueFlexible(v, st)) {
+                    r.hasDue = true;
+                    r.due = st;
+                }
+                else {
+                    MessageBoxW(gDoc.hwnd,
+                        L"Invalid due date.\n\nType as:\n  ddmmyyyy  (8 digits)\nOR\n  dd.mm.yyyy",
+                        L"Due date", MB_ICONERROR);
+                    // Keep editor open on invalid input
+                    SetFocus(gDoc.overlayEdit);
+                    SendMessageW(gDoc.overlayEdit, EM_SETSEL, 0, -1);
+                    return;
+                }
+            }
+        }
+    }
+
+    DocList_EnsureOverlayHidden();
+    DocList_RebuildView();
+}
+
+// TAB in Job No:
+// - normalize to job7
+// - auto-fill Description from real folder name excluding job7
+static void DocList_AutofillDescFromFolder(int viewRow)
+{
+    int modelIndex = -1;
+    if (!DocList_ViewIndexToModel(viewRow, modelIndex)) return;
+
+    ProjectRow& r = gDoc.rows[modelIndex];
+
+    std::wstring job7;
+    if (!ParseJob7FromInput(r.job, job7)) {
+        std::wstring up = r.job;
+        for (auto& ch : up) ch = (wchar_t)towupper(ch);
+        if (up.size() >= 7) job7 = up.substr(0, 7);
+        else return;
+    }
+
+    r.job = job7;
+
+    std::wstring projectPath;
+    if (ResolveProjectFolderFromJob7(job7, projectPath) && DirectoryExists(projectPath)) {
+        std::wstring folderName = LeafNameFromPath(projectPath);
+
+        std::wstring upFolder = folderName;
+        for (auto& ch : upFolder) ch = (wchar_t)towupper(ch);
+
+        std::wstring remainder;
+        if (upFolder.size() >= 7 && _wcsnicmp(upFolder.c_str(), job7.c_str(), 7) == 0) {
+            remainder = folderName.substr(7);
+        }
+        else {
+            remainder = folderName;
+        }
+
+        remainder = TrimLeadingSeparators(remainder);
+        r.desc = remainder;
+    }
+}
+
+static void DocList_AddEmptyLine()
+{
+    ProjectRow r{};
+    r.job = L"";
+    r.desc = L"";
+    r.scope = L"";
+    r.progress = 0; // disabled
+    r.hasDue = false;
+    r.status = 1;   // default status to 1
+
+    gDoc.rows.push_back(r);
+    DocList_RebuildView();
+
+    int viewIndex = -1;
+    int modelIndex = (int)gDoc.rows.size() - 1;
+    for (int i = 0; i < (int)gDoc.viewToModel.size(); ++i) {
+        if (gDoc.viewToModel[i] == modelIndex) { viewIndex = i; break; }
+    }
+    if (viewIndex >= 0) {
+        ListView_EnsureVisible(gDoc.lv, viewIndex, FALSE);
+        DocList_StartEditCell(viewIndex, 0);
+    }
+}
+
+static void DocList_RemoveRowByViewIndex(int viewIndex)
+{
+    int modelIndex = -1;
+    if (!DocList_ViewIndexToModel(viewIndex, modelIndex)) return;
+    if (modelIndex < 0 || modelIndex >= (int)gDoc.rows.size()) return;
+    gDoc.rows.erase(gDoc.rows.begin() + modelIndex);
+    DocList_RebuildView();
+}
+
+static void DocList_OpenProjectFolderFromRow(int viewIndex)
+{
+    int modelIndex = -1;
+    if (!DocList_ViewIndexToModel(viewIndex, modelIndex)) return;
+
+    std::wstring job7;
+    if (!ParseJob7FromInput(gDoc.rows[modelIndex].job, job7)) {
+        std::wstring up = gDoc.rows[modelIndex].job;
+        for (auto& ch : up) ch = (wchar_t)towupper(ch);
+        if (up.size() >= 7) job7 = up.substr(0, 7);
+        else return;
+    }
+
+    std::wstring path;
+    if (!ResolveProjectFolderFromJob7(job7, path) || !DirectoryExists(path)) {
+        std::wstring msg = L"Project folder not found:\n\n" + path;
+        MessageBoxW(gDoc.hwnd, msg.c_str(), L"Not found", MB_ICONERROR);
+        return;
+    }
+
+    OpenFolderInExplorer(path);
+    AddRecentFolder(path);
+}
+
+static void DocList_Layout(HWND hwnd)
+{
+    RECT r{}; GetClientRect(hwnd, &r);
+
+    const int pad = 12;
+    const int bottomBarH = 44;
+
+    RECT listRc = r;
+    listRc.left += pad;
+    listRc.right -= pad;
+    listRc.top += pad;
+    listRc.bottom -= (bottomBarH + pad);
+
+    SetWindowPos(gDoc.lv, nullptr, listRc.left, listRc.top,
+        listRc.right - listRc.left, listRc.bottom - listRc.top,
+        SWP_NOZORDER);
+
+    int y = r.bottom - bottomBarH + 8;
+
+    SetWindowPos(gDoc.btnAdd, nullptr, pad, y, 90, 26, SWP_NOZORDER);
+    SetWindowPos(gDoc.btnSave, nullptr, pad + 100, y, 70, 26, SWP_NOZORDER);
+
+    HWND lblStatus = GetDlgItem(hwnd, 9001);
+    HWND lblDesc = GetDlgItem(hwnd, 9002);
+
+    SetWindowPos(lblStatus, nullptr, pad + 190, y + 4, 90, 18, SWP_NOZORDER);
+    SetWindowPos(gDoc.editStatusFilter, nullptr, pad + 270, y, 50, 26, SWP_NOZORDER);
+
+    SetWindowPos(lblDesc, nullptr, pad + 330, y + 4, 110, 18, SWP_NOZORDER);
+    SetWindowPos(gDoc.editDescFilter, nullptr, pad + 430, y, 240, 26, SWP_NOZORDER);
+}
+
+static void DocList_InitColumns(HWND lv)
+{
+    // Columns:
+    // 0 Job No, 1 Open folder icon, 2 Description, 3 Scope, 4 Progress (hidden),
+    // 5 Due, 6 Status, 7 Remove
+    LVCOLUMNW col{};
+    col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
+
+    col.fmt = LVCFMT_LEFT;
+
+    col.pszText = (LPWSTR)L"Job No.";
+    col.cx = 110;
+    ListView_InsertColumn(lv, 0, &col);
+
+    col.pszText = (LPWSTR)L"";
+    col.cx = 34;
+    col.fmt = LVCFMT_CENTER;
+    ListView_InsertColumn(lv, 1, &col);
+
+    col.pszText = (LPWSTR)L"Description";
+    col.cx = 340;
+    col.fmt = LVCFMT_LEFT;
+    ListView_InsertColumn(lv, 2, &col);
+
+    col.pszText = (LPWSTR)L"Scope";
+    col.cx = 260;
+    col.fmt = LVCFMT_LEFT;
+    ListView_InsertColumn(lv, 3, &col);
+
+    // Progress disabled: hide column
+    col.pszText = (LPWSTR)L"Progress";
+    col.cx = 0;
+    col.fmt = LVCFMT_CENTER;
+    ListView_InsertColumn(lv, 4, &col);
+
+    col.pszText = (LPWSTR)L"Due";
+    col.cx = 110; // dd.MM.yyyy
+    col.fmt = LVCFMT_LEFT;
+    ListView_InsertColumn(lv, 5, &col);
+
+    col.pszText = (LPWSTR)L"Status";
+    col.cx = 60;
+    col.fmt = LVCFMT_CENTER;
+    ListView_InsertColumn(lv, 6, &col);
+
+    col.pszText = (LPWSTR)L"";
+    col.cx = 40;
+    col.fmt = LVCFMT_CENTER;
+    ListView_InsertColumn(lv, 7, &col);
+}
+
+static void DocList_ApplyRowHeight(HWND lv)
+{
+    if (gDoc.rowHeightIL) {
+        ImageList_Destroy(gDoc.rowHeightIL);
+        gDoc.rowHeightIL = nullptr;
+    }
+
+    HDC hdc = GetDC(lv);
+    HFONT old = (HFONT)SelectObject(hdc, gUIFont);
+    TEXTMETRICW tm{};
+    GetTextMetricsW(hdc, &tm);
+    SelectObject(hdc, old);
+    ReleaseDC(lv, hdc);
+
+    int rowH = max(26, tm.tmHeight + 10);
+    gDoc.rowHeightIL = ImageList_Create(1, rowH, ILC_COLOR32, 1, 1);
+    if (gDoc.rowHeightIL) {
+        ListView_SetImageList(lv, gDoc.rowHeightIL, LVSIL_SMALL);
+    }
+}
+
+static void DocList_StartEditCell(int viewRow, int subItem)
+{
+    int modelIndex = -1;
+    if (!DocList_ViewIndexToModel(viewRow, modelIndex)) return;
+
+    RECT rc{};
+    ListView_GetSubItemRect(gDoc.lv, viewRow, subItem, LVIR_BOUNDS, &rc);
+
+    POINT tl{ rc.left, rc.top };
+    ClientToScreen(gDoc.lv, &tl);
+    ScreenToClient(gDoc.hwnd, &tl);
+
+    int w = rc.right - rc.left;
+    int h = rc.bottom - rc.top;
+
+    DocList_EnsureOverlayHidden();
+
+    gDoc.editRow = viewRow;
+    gDoc.editSubItem = subItem;
+
+    ProjectRow& r = gDoc.rows[modelIndex];
+
+    // Editable columns (progress disabled):
+    // 0 Job, 2 Desc, 3 Scope, 5 Due, 6 Status
+    if (subItem == 0 || subItem == 2 || subItem == 3 || subItem == 5 || subItem == 6) {
+        std::wstring initial;
+
+        if (subItem == 0) initial = r.job;
+        if (subItem == 2) initial = r.desc;
+        if (subItem == 3) initial = r.scope;
+        if (subItem == 6) initial = std::to_wstring(r.status);
+
+        if (subItem == 5) {
+            initial = r.hasDue ? FormatDue_DDMMYYYY_Dots(r.due) : L"";
+            SendMessageW(gDoc.overlayEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"dd.mm.yyyy");
+            SendMessageW(gDoc.overlayEdit, EM_SETLIMITTEXT, 10, 0);
+        }
+        else {
+            SendMessageW(gDoc.overlayEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"");
+            SendMessageW(gDoc.overlayEdit, EM_SETLIMITTEXT, 2047, 0);
+        }
+
+        SetWindowTextW(gDoc.overlayEdit, initial.c_str());
+        SetWindowPos(gDoc.overlayEdit, nullptr, tl.x, tl.y, w, h, SWP_NOZORDER | SWP_SHOWWINDOW);
+        SetFocus(gDoc.overlayEdit);
+        SendMessageW(gDoc.overlayEdit, EM_SETSEL, 0, -1);
+        return;
+    }
+}
+
+// Overlay edit proc:
+// - TAB on Job No commits, auto-fills desc, then goes to Description cell.
+// - TAB elsewhere skips Progress (4) and goes to Due (5), then Status (6), then loops.
+static LRESULT CALLBACK OverlayEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (msg == WM_KEYDOWN && wParam == VK_TAB) {
+        int viewRow = gDoc.editRow;
+        int subItem = gDoc.editSubItem;
+
+        DocList_CommitOverlay(false);
+
+        if (subItem == 0 && viewRow >= 0) {
+            DocList_AutofillDescFromFolder(viewRow);
+            DocList_RebuildView();
+            DocList_StartEditCell(viewRow, 2);
+        }
+        else if (viewRow >= 0) {
+            int next = -1;
+            if (subItem == 2) next = 3;
+            else if (subItem == 3) next = 5; // skip progress (4)
+            else if (subItem == 5) next = 6;
+            else if (subItem == 6) next = 0;
+            if (next >= 0) DocList_StartEditCell(viewRow, next);
+        }
+        return 0;
+    }
+
+    if (msg == WM_KEYDOWN && wParam == VK_ESCAPE) {
+        DocList_CommitOverlay(true);
+        return 0;
+    }
+
+    if (msg == WM_KEYDOWN && wParam == VK_RETURN) {
+        DocList_CommitOverlay(false);
+        return 0;
+    }
+
+    return CallWindowProcW(gOldOverlayEditProc, hwnd, msg, wParam, lParam);
+}
+
+static LRESULT CALLBACK DocListProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+    case WM_CREATE:
+    {
+        gDoc.hwnd = hwnd;
+
+        gDoc.lv = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            WC_LISTVIEWW, L"",
+            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+            0, 0, 10, 10,
+            hwnd, (HMENU)(INT_PTR)ID_DOC_LISTVIEW, GetModuleHandleW(nullptr), nullptr);
+
+        ApplyFont(gDoc.lv, gUIFont);
+
+        ListView_SetExtendedListViewStyle(gDoc.lv,
+            LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+
+        DocList_InitColumns(gDoc.lv);
+        DocList_ApplyRowHeight(gDoc.lv);
+
+        gDoc.btnAdd = CreateWindowW(L"BUTTON", L"Add Line",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)ID_DOC_ADDLINE, nullptr, nullptr);
+        ApplyFont(gDoc.btnAdd, gUIFont);
+
+        gDoc.btnSave = CreateWindowW(L"BUTTON", L"Save",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)ID_DOC_SAVE, nullptr, nullptr);
+        ApplyFont(gDoc.btnSave, gUIFont);
+
+        CreateWindowW(L"STATIC", L"Status Filter:",
+            WS_CHILD | WS_VISIBLE,
+            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)9001, nullptr, nullptr);
+
+        gDoc.editStatusFilter = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)ID_DOC_FILTER_STATUS, nullptr, nullptr);
+        ApplyFont(gDoc.editStatusFilter, gUIFont);
+
+        CreateWindowW(L"STATIC", L"Description Filter:",
+            WS_CHILD | WS_VISIBLE,
+            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)9002, nullptr, nullptr);
+
+        gDoc.editDescFilter = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)ID_DOC_FILTER_DESC, nullptr, nullptr);
+        ApplyFont(gDoc.editDescFilter, gUIFont);
+
+        gDoc.overlayEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | ES_AUTOHSCROLL,
+            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)ID_DOC_OVERLAY_EDIT, nullptr, nullptr);
+        ApplyFont(gDoc.overlayEdit, gUIFont);
+        ShowWindow(gDoc.overlayEdit, SW_HIDE);
+
+        gOldOverlayEditProc = (WNDPROC)SetWindowLongPtrW(gDoc.overlayEdit, GWLP_WNDPROC, (LONG_PTR)OverlayEditProc);
+
+        // Progress slider exists but is not used (progress disabled)
+        gDoc.overlaySlider = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
+            WS_CHILD | TBS_AUTOTICKS,
+            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)ID_DOC_OVERLAY_SLIDER, nullptr, nullptr);
+        ApplyFont(gDoc.overlaySlider, gUIFont);
+        ShowWindow(gDoc.overlaySlider, SW_HIDE);
+
+        LoadDocListFromDisk();
+        DocList_RebuildView();
+        DocList_Layout(hwnd);
+
+        return 0;
+    }
+
+    case WM_SIZE:
+        DocList_Layout(hwnd);
+        return 0;
+
+    case WM_ERASEBKGND:
+    {
+        HDC hdc = (HDC)wParam;
+        RECT r; GetClientRect(hwnd, &r);
+        FillRect(hdc, &r, gBgBrush);
+        return TRUE;
+    }
+
+    case WM_CTLCOLORDLG:
+        return (INT_PTR)gBgBrush;
+
+    case WM_CTLCOLORSTATIC:
+    {
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, gSettings.fg);
+        SetBkMode(hdc, TRANSPARENT);
+        return (INT_PTR)gBgBrush;
+    }
+
+    // white edit fields (filters + overlay edit)
+    case WM_CTLCOLOREDIT:
+    {
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, RGB(0, 0, 0));
+        SetBkColor(hdc, RGB(255, 255, 255));
+        SetBkMode(hdc, OPAQUE);
+        return (INT_PTR)(gEditWhiteBrush ? gEditWhiteBrush : (HBRUSH)GetStockObject(WHITE_BRUSH));
+    }
+
+    case WM_DRAWITEM:
+    {
+        const DRAWITEMSTRUCT* dis = (const DRAWITEMSTRUCT*)lParam;
+        if (dis && dis->CtlType == ODT_BUTTON) {
+            wchar_t text[128]{};
+            GetWindowTextW(dis->hwndItem, text, _countof(text));
+            bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+            bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+            bool focused = (dis->itemState & ODS_FOCUS) != 0;
+            DrawFancyIconTile(dis->hDC, dis->rcItem, text, gUIFont, false, pressed, disabled, focused);
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_COMMAND:
+    {
+        const int id = LOWORD(wParam);
+
+        if (id == ID_DOC_ADDLINE) {
+            DocList_AddEmptyLine();
+            return 0;
+        }
+        if (id == ID_DOC_SAVE) {
+            SaveDocListToDisk();
+            MessageBoxW(hwnd, L"Saved.", L"Project List", MB_OK | MB_ICONINFORMATION);
+            return 0;
+        }
+        if (id == ID_DOC_FILTER_STATUS || id == ID_DOC_FILTER_DESC) {
+            if (HIWORD(wParam) == EN_CHANGE) {
+                DocList_RebuildView();
+            }
+            return 0;
+        }
+        return 0;
+    }
+
+    case WM_NOTIFY:
+    {
+        NMHDR* hdr = (NMHDR*)lParam;
+        if (!hdr) break;
+
+        if (hdr->idFrom == ID_DOC_LISTVIEW)
+        {
+            if (hdr->code == NM_CUSTOMDRAW) {
+                NMLVCUSTOMDRAW* cd = (NMLVCUSTOMDRAW*)lParam;
+                if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+                if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) return CDRF_NOTIFYSUBITEMDRAW;
+                if (cd->nmcd.dwDrawStage == (CDDS_ITEMPREPAINT | CDDS_SUBITEM)) {
+                    int viewRow = (int)cd->nmcd.dwItemSpec;
+                    int modelIndex = -1;
+                    COLORREF rowClr = Blend(gSettings.bg, gSettings.fg, 18);
+                    if (gDoc.lv && DocList_ViewIndexToModel(viewRow, modelIndex)) {
+                        rowClr = StatusToRowColor(gDoc.rows[modelIndex].status);
+                    }
+
+                    cd->clrText = RGB(0, 0, 0);
+                    cd->clrTextBk = rowClr;
+
+                    if (cd->iSubItem == 1 || cd->iSubItem == 7) {
+                        SelectObject(cd->nmcd.hdc, gIconFont);
+                    }
+                    else {
+                        SelectObject(cd->nmcd.hdc, gUIFont);
+                    }
+
+                    return CDRF_NEWFONT;
+                }
+            }
+
+            if (hdr->code == NM_CLICK) {
+                LPNMITEMACTIVATE ia = (LPNMITEMACTIVATE)lParam;
+                if (!ia) break;
+
+                int viewRow = ia->iItem;
+                int sub = ia->iSubItem;
+
+                if (viewRow >= 0) {
+                    if (sub == 1) { // Open project folder
+                        DocList_OpenProjectFolderFromRow(viewRow);
+                        return 0;
+                    }
+                    if (sub == 7) { // Remove
+                        DocList_RemoveRowByViewIndex(viewRow);
+                        return 0;
+                    }
+                }
+            }
+
+            if (hdr->code == NM_DBLCLK) {
+                LPNMITEMACTIVATE ia = (LPNMITEMACTIVATE)lParam;
+                if (!ia) break;
+
+                int viewRow = ia->iItem;
+                int sub = ia->iSubItem;
+
+                if (viewRow >= 0 && sub >= 0) {
+                    // Progress (4) disabled: do not allow editing
+                    if (sub == 0 || sub == 2 || sub == 3 || sub == 5 || sub == 6) {
+                        DocList_StartEditCell(viewRow, sub);
+                        return 0;
+                    }
+                }
+            }
+        }
+
+        break;
+    }
+
+    case WM_CLOSE:
+        SaveDocListToDisk();
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+        DocList_EnsureOverlayHidden();
+        if (gDoc.rowHeightIL) {
+            ImageList_Destroy(gDoc.rowHeightIL);
+            gDoc.rowHeightIL = nullptr;
+        }
+        gDoc.hwnd = nullptr;
+        gDoc.lv = nullptr;
+        return 0;
+    }
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void OpenDocListWindow(HWND parent)
+{
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = DocListProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = kDocListClass;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        RegisterClassW(&wc);
+        registered = true;
+    }
+
+    HWND wnd = CreateWindowExW(
+        WS_EX_DLGMODALFRAME,
+        kDocListClass,
+        L"Project List",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_SIZEBOX,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        1150, 650,
+        parent, nullptr, GetModuleHandleW(nullptr),
+        nullptr);
+
+    if (!wnd) {
+        MessageBoxW(parent, L"Failed to open Project List window.", L"Error", MB_ICONERROR);
+        return;
+    }
+
+    ShowWindow(wnd, SW_SHOW);
+    UpdateWindow(wnd);
+    SetForegroundWindow(wnd);
+}
+
+// -------------------- Font creation --------------------
+
+static void CreateIconFont()
+{
+    LOGFONTW lf{};
+    lf.lfHeight = -20;
+    wcscpy_s(lf.lfFaceName, L"Segoe Fluent Icons");
+    HFONT fTry = CreateFontIndirectW(&lf);
+
+    bool ok = false;
+    if (fTry) {
+        HDC hdc = GetDC(nullptr);
+        HFONT old = (HFONT)SelectObject(hdc, fTry);
+        wchar_t face[LF_FACESIZE]{};
+        GetTextFaceW(hdc, LF_FACESIZE, face);
+        SelectObject(hdc, old);
+        ReleaseDC(nullptr, hdc);
+        ok = (_wcsicmp(face, L"Segoe Fluent Icons") == 0);
+    }
+
+    if (!ok) {
+        if (fTry) DeleteObject(fTry);
+        wcscpy_s(lf.lfFaceName, L"Segoe MDL2 Assets");
+        gIconFont = CreateFontIndirectW(&lf);
+    }
+    else {
+        gIconFont = fTry;
+    }
+}
+
+static HWND CreateIconButton(HWND parent, int id, const wchar_t* glyph)
+{
+    HWND b = CreateWindowW(L"BUTTON", glyph,
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        0, 0, 10, 10,
+        parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    ApplyFont(b, gIconFont);
+    return b;
+}
+
+// -------------------- Main proc --------------------
+
+static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+    case WM_CREATE:
+    {
+        gMainHwnd = hwnd;
+
+        gUIFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        CreateIconFont();
+
+        LOGFONTW lf{};
+        GetObjectW(gUIFont, sizeof(lf), &lf);
+        lf.lfHeight = -16;
+        gMenuFont = CreateFontIndirectW(&lf);
+
+        RebuildBrush();
+
+        gBtnFlag = CreateIconButton(hwnd, ID_BTN_FLAG, L"\uE7C1");
+        gBtnFolder = CreateIconButton(hwnd, ID_BTN_FOLDER, L"\uE8B7");
+        gBtnDoc = CreateIconButton(hwnd, ID_BTN_DOC, L"\uE8A5");
+        gBtnMail = CreateIconButton(hwnd, ID_BTN_MAIL, L"\uE715");
+        gBtnCal = CreateIconButton(hwnd, ID_BTN_CAL, L"\uE787");
+        gBtnPhone = CreateIconButton(hwnd, ID_BTN_PHONE, L"\uE717");
+        gBtnGear = CreateIconButton(hwnd, ID_BTN_GEAR, L"\uE713");
+
+        gEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            0, 0, 10, 10,
+            hwnd, (HMENU)(INT_PTR)ID_EDIT, nullptr, nullptr);
+        ApplyFont(gEdit, gUIFont);
+        SendMessageW(gEdit, EM_SETLIMITTEXT, 7, 0);
+        SendMessageW(gEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"B00XXXX");
+        gOldEditProc = (WNDPROC)SetWindowLongPtrW(gEdit, GWLP_WNDPROC, (LONG_PTR)EditProc);
+
+        LayoutMainBar();
+        SetFocus(gEdit);
+        return 0;
+    }
+
+    case WM_MEASUREITEM:
+    {
+        auto* mi = (MEASUREITEMSTRUCT*)lParam;
+        if (mi && mi->CtlType == ODT_MENU) { MeasureThemedMenuItem(mi); return TRUE; }
+        break;
+    }
+
+    case WM_DRAWITEM:
+    {
+        const DRAWITEMSTRUCT* dis = (const DRAWITEMSTRUCT*)lParam;
+        if (!dis) break;
+        if (dis->CtlType == ODT_BUTTON) { DrawFancyIconButton(dis); return TRUE; }
+        if (dis->CtlType == ODT_MENU) { DrawThemedMenuItem(dis); return TRUE; }
+        break;
+    }
+
+    case WM_MOUSEMOVE:
+    {
+        POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        HWND hChild = ChildWindowFromPointEx(hwnd, pt, CWP_SKIPINVISIBLE);
+
+        HWND newHover = nullptr;
+        if (hChild == gBtnFlag || hChild == gBtnFolder || hChild == gBtnDoc ||
+            hChild == gBtnMail || hChild == gBtnCal || hChild == gBtnPhone || hChild == gBtnGear)
+            newHover = hChild;
+
+        if (newHover != gHoverBtn) {
+            HWND old = gHoverBtn;
+            gHoverBtn = newHover;
+            if (old) InvalidateRect(old, nullptr, TRUE);
+            if (gHoverBtn) InvalidateRect(gHoverBtn, nullptr, TRUE);
+        }
+        BeginTrackMouseLeave();
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        gTrackingMouseLeave = false;
+        if (gHoverBtn) {
+            HWND old = gHoverBtn;
+            gHoverBtn = nullptr;
+            InvalidateRect(old, nullptr, TRUE);
+        }
+        return 0;
+
+    case WM_COMMAND:
+    {
+        const int id = LOWORD(wParam);
+
+        if (id == ID_BTN_GEAR) { OpenSettingsDialog(hwnd); SetFocus(gEdit); return 0; }
+        if (id == ID_BTN_CAL) { OutlookOpenCalendar(); return 0; }
+        if (id == ID_BTN_FOLDER) { ShowFolderDropdown(); return 0; }
+        if (id == ID_BTN_FLAG) { ShowRecentDropdown(); return 0; }
+        if (id == ID_BTN_DOC) { OpenDocListWindow(hwnd); return 0; }
+
+        return 0;
+    }
+
+    case WM_CONTEXTMENU:
+    {
+        HWND hCtrl = (HWND)wParam;
+        if (hCtrl == gBtnCal) {
+            POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            if (pt.x == -1 && pt.y == -1) {
+                RECT r{}; GetWindowRect(gBtnCal, &r);
+                pt.x = r.left; pt.y = r.bottom;
+            }
+            ShowCalendarContextMenu(hwnd, pt);
+            return 0;
+        }
+        break;
+    }
+
+    // Drag borderless window by empty background.
+    case WM_NCHITTEST:
+    {
+        LRESULT hit = DefWindowProcW(hwnd, msg, wParam, lParam);
+        if (hit == HTCLIENT) {
+            POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            ScreenToClient(hwnd, &pt);
+            HWND hChild = ChildWindowFromPointEx(hwnd, pt, CWP_SKIPINVISIBLE);
+            if (hChild && hChild != hwnd) return HTCLIENT;
+            return HTCAPTION;
+        }
+        return hit;
+    }
+
+    case WM_ERASEBKGND:
+    {
+        HDC hdc = (HDC)wParam;
+        RECT r{}; GetClientRect(hwnd, &r);
+        FillRect(hdc, &r, gBgBrush ? gBgBrush : (HBRUSH)GetStockObject(BLACK_BRUSH));
+        return 1;
+    }
+
+    case WM_CTLCOLORSTATIC:
+    {
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, gSettings.fg);
+        SetBkMode(hdc, TRANSPARENT);
+        return (INT_PTR)(gBgBrush ? gBgBrush : (HBRUSH)GetStockObject(BLACK_BRUSH));
+    }
+
+    // white main edit
+    case WM_CTLCOLOREDIT:
+    {
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, RGB(0, 0, 0));
+        SetBkColor(hdc, RGB(255, 255, 255));
+        SetBkMode(hdc, OPAQUE);
+        return (INT_PTR)(gEditWhiteBrush ? gEditWhiteBrush : (HBRUSH)GetStockObject(WHITE_BRUSH));
+    }
+
+    case WM_DESTROY:
+        if (gIconFont) DeleteObject(gIconFont);
+        if (gMenuFont) DeleteObject(gMenuFont);
+        if (gBgBrush) DeleteObject(gBgBrush);
+        if (gMenuBgBrush) DeleteObject(gMenuBgBrush);
+        if (gSelBrush) DeleteObject(gSelBrush);
+        if (gEditWhiteBrush) DeleteObject(gEditWhiteBrush);
+        PostQuitMessage(0);
+        return 0;
+    }
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// -------------------- wWinMain --------------------
+
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
+{
+    INITCOMMONCONTROLSEX icc{ sizeof(icc),
+        (DWORD)(ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES) };
+    InitCommonControlsEx(&icc);
+
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = MainProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = kMainClassName;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+
+    if (!RegisterClassW(&wc)) {
+        MessageBoxW(nullptr, L"Failed to register main window class.", L"Error", MB_ICONERROR);
+        return 1;
+    }
+
+    // Borderless bar.
+    HWND hwnd = CreateWindowExW(
+        0, kMainClassName, kTitle,
+        WS_POPUP,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        520, 46,
+        nullptr, nullptr, hInstance, nullptr);
+
+    if (!hwnd) {
+        MessageBoxW(nullptr, L"Failed to create window.", L"Error", MB_ICONERROR);
+        return 1;
+    }
+
+    ShowWindow(hwnd, nCmdShow);
+    UpdateWindow(hwnd);
+
+    MSG m;
+    while (GetMessageW(&m, nullptr, 0, 0) > 0) {
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
+    }
+    return 0;
+}

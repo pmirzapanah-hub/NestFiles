@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="Project Finder/Project Finder.vcxproj" Id="b2fee199-37e8-4405-b4b1-5dd727bf3401" />
+</Solution>
